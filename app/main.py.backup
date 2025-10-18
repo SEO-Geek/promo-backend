@@ -1,0 +1,1357 @@
+"""
+Promotional Content Management System - FastAPI Application
+Main application entry point with authentication and core endpoints
+Created: October 16, 2025
+Updated: October 17, 2025 - Added rate limiting
+"""
+from fastapi import FastAPI, HTTPException, Depends, status, Request, APIRouter
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from datetime import datetime, timedelta
+from typing import List
+from pathlib import Path
+import logging
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+# Internal imports
+from app.config import settings
+from app.database import db, get_db, Database
+from app.auth import (
+    authenticate_user,
+    create_access_token,
+    get_current_user,
+    get_password_hash
+)
+from app.ollama_service import OllamaService
+from app.models import (
+    LoginRequest,
+    TokenResponse,
+    UserResponse,
+    OfferCreate,
+    OfferUpdate,
+    OfferResponse,
+    OfferListResponse,
+    HealthCheckResponse,
+    PromoContentResponse,
+    TextGenerationRequest,
+    TextVariationResponse
+)
+# Leonardo AI service and image models removed October 18, 2025
+# Newsletter promo system uses text-only variations
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO if not settings.DEBUG else logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Rate Limiting Configuration
+# ============================================================================
+
+# Initialize rate limiter with IP-based tracking
+limiter = Limiter(key_func=get_remote_address)
+
+# ============================================================================
+# FastAPI Application
+# ============================================================================
+
+app = FastAPI(
+    title="Promotional Content Management API",
+    description="AI-powered newsletter promotional system with fail-safe architecture",
+    version="1.0.0",
+    docs_url="/api/v1/docs",
+    redoc_url="/api/v1/redoc"
+)
+
+# Attach rate limiter to app
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.allowed_origins_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================================
+# Lifecycle Events
+# ============================================================================
+
+@app.on_event("startup")
+async def startup():
+    """Initialize database connection on startup"""
+    logger.info("🚀 Starting Promotional Content Management System")
+    await db.connect()
+    logger.info("✅ Application started successfully")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    """Close database connection on shutdown"""
+    logger.info("Shutting down application")
+    await db.disconnect()
+
+
+# ============================================================================
+# Authentication Endpoints
+# ============================================================================
+
+@app.post("/api/v1/auth/login", response_model=TokenResponse, tags=["Authentication"])
+@limiter.limit("5/minute")  # Strict limit to prevent brute force attacks
+async def login(
+    request: Request,
+    credentials: LoginRequest,
+    database: Database = Depends(get_db)
+):
+    """
+    User login endpoint
+
+    Returns JWT access token valid for 24 hours
+    """
+    user = await authenticate_user(credentials.email, credentials.password, database)
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Create access token
+    access_token = create_access_token(
+        data={"sub": user['email']}
+    )
+
+    # Update last login
+    await database.execute(
+        "UPDATE promo_users SET last_login = $1 WHERE id = $2",
+        datetime.utcnow(),
+        user['id']
+    )
+
+    logger.info(f"✅ User logged in: {user['email']}")
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "id": user['id'],
+            "email": user['email'],
+            "name": user['name'],
+            "role": user['role']
+        }
+    }
+
+
+@app.get("/api/v1/auth/me", response_model=UserResponse, tags=["Authentication"])
+@limiter.limit("100/minute")  # Standard rate limit for authenticated queries
+async def get_current_user_info(request: Request, current_user = Depends(get_current_user)):
+    """
+    Get current authenticated user information
+    """
+    return {
+        "id": current_user['id'],
+        "email": current_user['email'],
+        "name": current_user['name'],
+        "role": current_user['role'],
+        "last_login": current_user['last_login'],
+        "created_at": current_user['created_at']
+    }
+
+
+# ============================================================================
+# Health Check Endpoint (Fail-Safe System)
+# ============================================================================
+
+@app.get("/api/v1/promo/health", response_model=HealthCheckResponse, tags=["Fail-Safe"])
+@limiter.limit("60/minute")  # Allow frequent health check polling
+async def health_check(request: Request, database: Database = Depends(get_db)):
+    """
+    Comprehensive health check for fail-safe system
+
+    Checks:
+    - Database connectivity
+    - Active offers availability
+    - Approved content availability
+
+    Returns health status for newsletter generation system
+    """
+    health = {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "components": {},
+        "can_provide_content": True
+    }
+
+    # Check database
+    try:
+        await database.fetchval("SELECT 1")
+        health["components"]["database"] = "healthy"
+    except Exception as e:
+        health["components"]["database"] = f"failed: {str(e)}"
+        health["status"] = "failed"
+        health["can_provide_content"] = False
+
+    # Check active offers
+    try:
+        active_count = await database.fetchval("""
+            SELECT COUNT(*) FROM promo_offers
+            WHERE status = 'active'
+            AND (start_date IS NULL OR start_date <= NOW())
+            AND (end_date IS NULL OR end_date >= NOW())
+        """)
+
+        if active_count > 0:
+            health["components"]["active_offers"] = f"healthy ({active_count} offers)"
+        else:
+            health["components"]["active_offers"] = "degraded (no active offers)"
+            health["status"] = "degraded"
+            health["can_provide_content"] = False
+
+    except Exception as e:
+        health["components"]["active_offers"] = f"failed: {str(e)}"
+        health["status"] = "failed"
+        health["can_provide_content"] = False
+
+    # Check approved content availability
+    try:
+        content_check = await database.fetchrow("""
+            SELECT
+                COUNT(DISTINCT o.id) as offers_with_content
+            FROM promo_offers o
+            WHERE o.status = 'active'
+            AND (o.start_date IS NULL OR o.start_date <= NOW())
+            AND (o.end_date IS NULL OR o.end_date >= NOW())
+            AND EXISTS (
+                SELECT 1 FROM promo_images i
+                WHERE i.offer_id = o.id AND i.approved = TRUE
+            )
+            AND EXISTS (
+                SELECT 1 FROM promo_text_variations t
+                WHERE t.offer_id = o.id AND t.approved = TRUE
+            )
+        """)
+
+        if content_check['offers_with_content'] > 0:
+            health["components"]["approved_content"] = f"healthy ({content_check['offers_with_content']} ready)"
+        else:
+            health["components"]["approved_content"] = "degraded (no approved content)"
+            health["status"] = "degraded"
+            health["can_provide_content"] = False
+
+    except Exception as e:
+        health["components"]["approved_content"] = f"failed: {str(e)}"
+        health["status"] = "failed"
+        health["can_provide_content"] = False
+
+    status_code = 200 if health["status"] == "healthy" else 503
+
+    return JSONResponse(content=health, status_code=status_code)
+
+
+# ============================================================================
+# Offer Management Endpoints (CRUD)
+# ============================================================================
+
+@app.post("/api/v1/offers", response_model=OfferResponse, tags=["Offers"])
+@limiter.limit("100/minute")  # Standard CRUD operation limit
+async def create_offer(
+    request: Request,
+    offer: OfferCreate,
+    current_user = Depends(get_current_user),
+    database: Database = Depends(get_db)
+):
+    """
+    Create a new promotional offer
+
+    Requires authentication. Creates offer in 'draft' status by default.
+    """
+    try:
+        result = await database.fetchrow("""
+            INSERT INTO promo_offers (
+                name, description, destination_url, affiliate_slug,
+                status, start_date, end_date, priority, weight,
+                created_by, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+            RETURNING id, name, description, destination_url, affiliate_slug, status,
+                      start_date, end_date, priority, weight,
+                      total_impressions, total_clicks, ctr,
+                      created_at, updated_at
+        """, offer.name, offer.description, str(offer.destination_url),
+            offer.affiliate_slug, offer.status, offer.start_date, offer.end_date,
+            offer.priority, offer.weight, current_user['id']
+        )
+
+        logger.info(f"✅ Offer created: {result['name']} (ID: {result['id']}) by {current_user['email']}")
+
+        return dict(result)
+
+    except Exception as e:
+        logger.error(f"Failed to create offer: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create offer: {str(e)}")
+
+
+@app.get("/api/v1/offers", response_model=OfferListResponse, tags=["Offers"])
+@limiter.limit("100/minute")  # Standard CRUD operation limit
+async def list_offers(
+    request: Request,
+    status_filter: str = None,
+    current_user = Depends(get_current_user),
+    database: Database = Depends(get_db)
+):
+    """
+    List all promotional offers
+
+    Optional filter by status: active, paused, ended, draft
+    """
+    try:
+        # Build query with parameterized WHERE clause to prevent SQL injection
+        query = """
+            SELECT id, name, description, destination_url, affiliate_slug, status,
+                   start_date, end_date, priority, weight,
+                   total_impressions, total_clicks, ctr,
+                   created_at, updated_at
+            FROM promo_offers
+        """
+
+        params = []
+        if status_filter:
+            query += " WHERE status = $1"
+            params.append(status_filter)
+
+        query += " ORDER BY priority DESC, created_at DESC"
+
+        offers = await database.fetch(query, *params)
+
+        return {
+            "offers": [dict(offer) for offer in offers],
+            "total": len(offers)
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to list offers: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list offers: {str(e)}")
+
+
+@app.get("/api/v1/offers/{offer_id}", response_model=OfferResponse, tags=["Offers"])
+@limiter.limit("100/minute")  # Standard CRUD operation limit
+async def get_offer(
+    request: Request,
+    offer_id: int,
+    current_user = Depends(get_current_user),
+    database: Database = Depends(get_db)
+):
+    """
+    Get a single promotional offer by ID
+
+    Includes full details and statistics
+    """
+    try:
+        offer = await database.fetchrow("""
+            SELECT id, name, description, destination_url, affiliate_slug, status,
+                   start_date, end_date, priority, weight,
+                   total_impressions, total_clicks, ctr,
+                   created_at, updated_at
+            FROM promo_offers
+            WHERE id = $1
+        """, offer_id)
+
+        if not offer:
+            raise HTTPException(status_code=404, detail=f"Offer {offer_id} not found")
+
+        return dict(offer)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get offer {offer_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get offer: {str(e)}")
+
+
+@app.put("/api/v1/offers/{offer_id}", response_model=OfferResponse, tags=["Offers"])
+@limiter.limit("100/minute")  # Standard CRUD operation limit
+async def update_offer(
+    request: Request,
+    offer_id: int,
+    offer: OfferUpdate,
+    current_user = Depends(get_current_user),
+    database: Database = Depends(get_db)
+):
+    """
+    Update an existing promotional offer
+
+    Only provided fields will be updated
+    """
+    try:
+        # Build dynamic UPDATE query
+        updates = []
+        params = []
+        param_count = 1
+
+        if offer.name is not None:
+            updates.append(f"name = ${param_count}")
+            params.append(offer.name)
+            param_count += 1
+
+        if offer.description is not None:
+            updates.append(f"description = ${param_count}")
+            params.append(offer.description)
+            param_count += 1
+
+        if offer.destination_url is not None:
+            updates.append(f"destination_url = ${param_count}")
+            params.append(str(offer.destination_url))
+            param_count += 1
+
+        if offer.affiliate_slug is not None:
+            updates.append(f"affiliate_slug = ${param_count}")
+            params.append(offer.affiliate_slug)
+            param_count += 1
+
+        if offer.status is not None:
+            updates.append(f"status = ${param_count}")
+            params.append(offer.status)
+            param_count += 1
+
+        if offer.start_date is not None:
+            updates.append(f"start_date = ${param_count}")
+            params.append(offer.start_date)
+            param_count += 1
+
+        if offer.end_date is not None:
+            updates.append(f"end_date = ${param_count}")
+            params.append(offer.end_date)
+            param_count += 1
+
+        if offer.priority is not None:
+            updates.append(f"priority = ${param_count}")
+            params.append(offer.priority)
+            param_count += 1
+
+        if offer.weight is not None:
+            updates.append(f"weight = ${param_count}")
+            params.append(offer.weight)
+            param_count += 1
+
+        if not updates:
+            raise HTTPException(status_code=400, detail="No fields to update")
+
+        updates.append("updated_at = NOW()")
+        params.append(offer_id)
+
+        query = f"""
+            UPDATE promo_offers
+            SET {', '.join(updates)}
+            WHERE id = ${param_count}
+            RETURNING id, name, description, destination_url, affiliate_slug, status,
+                      start_date, end_date, priority, weight,
+                      total_impressions, total_clicks, ctr,
+                      created_at, updated_at
+        """
+
+        result = await database.fetchrow(query, *params)
+
+        if not result:
+            raise HTTPException(status_code=404, detail=f"Offer {offer_id} not found")
+
+        logger.info(f"✅ Offer updated: {result['name']} (ID: {result['id']}) by {current_user['email']}")
+
+        return dict(result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update offer {offer_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update offer: {str(e)}")
+
+
+@app.delete("/api/v1/offers/{offer_id}", tags=["Offers"])
+@limiter.limit("100/minute")  # Standard CRUD operation limit
+async def delete_offer(
+    request: Request,
+    offer_id: int,
+    current_user = Depends(get_current_user),
+    database: Database = Depends(get_db)
+):
+    """
+    Delete a promotional offer
+
+    Cascades to delete all associated images and text variations
+    """
+    try:
+        # Get offer name before deletion
+        offer = await database.fetchrow(
+            "SELECT name FROM promo_offers WHERE id = $1",
+            offer_id
+        )
+
+        if not offer:
+            raise HTTPException(status_code=404, detail=f"Offer {offer_id} not found")
+
+        await database.execute(
+            "DELETE FROM promo_offers WHERE id = $1",
+            offer_id
+        )
+
+        logger.info(f"✅ Offer deleted: {offer['name']} (ID: {offer_id}) by {current_user['email']}")
+
+        return {
+            "success": True,
+            "message": f"Offer '{offer['name']}' deleted successfully"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete offer {offer_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete offer: {str(e)}")
+
+
+# ============================================================================
+# Newsletter Preview Endpoint
+# ============================================================================
+
+@app.get("/api/v1/promo/preview/{offer_id}", tags=["Preview"])
+@limiter.limit("50/minute")  # Moderate limit for preview generation
+async def preview_newsletter(
+    request: Request,
+    offer_id: int,
+    image_id: int = None,
+    text_id: int = None,
+    current_user = Depends(get_current_user),
+    database: Database = Depends(get_db)
+):
+    """
+    Preview how a promotional offer will look in the newsletter
+
+    If image_id and text_id are not provided, uses first approved content.
+    Returns HTML ready to be displayed in an iframe or new window.
+    """
+    try:
+        # Get offer details
+        offer = await database.fetchrow("""
+            SELECT id, name, description, destination_url
+            FROM promo_offers
+            WHERE id = $1
+        """, offer_id)
+
+        if not offer:
+            raise HTTPException(status_code=404, detail=f"Offer {offer_id} not found")
+
+        # Get image (use provided ID or first approved)
+        if image_id:
+            image = await database.fetchrow("""
+                SELECT image_url, filename
+                FROM promo_images
+                WHERE id = $1 AND offer_id = $2
+            """, image_id, offer_id)
+        else:
+            image = await database.fetchrow("""
+                SELECT image_url, filename
+                FROM promo_images
+                WHERE offer_id = $1 AND approved = TRUE
+                ORDER BY created_at ASC
+                LIMIT 1
+            """, offer_id)
+
+        # Get text variation (use provided ID or first approved)
+        if text_id:
+            text = await database.fetchrow("""
+                SELECT text_content, cta_text
+                FROM promo_text_variations
+                WHERE id = $1 AND offer_id = $2
+            """, text_id, offer_id)
+        else:
+            text = await database.fetchrow("""
+                SELECT text_content, cta_text
+                FROM promo_text_variations
+                WHERE offer_id = $1 AND approved = TRUE
+                ORDER BY created_at ASC
+                LIMIT 1
+            """, offer_id)
+
+        if not image or not text:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "Missing content",
+                    "message": "This offer needs at least one approved image and text variation",
+                    "has_image": image is not None,
+                    "has_text": text is not None
+                }
+            )
+
+        # Generate preview HTML (newsletter template)
+        preview_html = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Newsletter Preview: {offer['name']}</title>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: #f4f4f4;
+            margin: 0;
+            padding: 20px;
+        }}
+        .newsletter-container {{
+            max-width: 600px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }}
+        .header {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px 20px;
+            text-align: center;
+        }}
+        .header h1 {{
+            margin: 0;
+            font-size: 28px;
+            font-weight: 700;
+        }}
+        .header p {{
+            margin: 10px 0 0 0;
+            opacity: 0.9;
+            font-size: 14px;
+        }}
+        .promo-section {{
+            padding: 30px 20px;
+            background: linear-gradient(to bottom, #f8f9ff 0%, white 100%);
+            border-bottom: 3px solid #667eea;
+        }}
+        .promo-label {{
+            display: inline-block;
+            background: #667eea;
+            color: white;
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 15px;
+        }}
+        .promo-image {{
+            width: 100%;
+            height: auto;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: block;
+        }}
+        .promo-text {{
+            font-size: 16px;
+            line-height: 1.8;
+            color: #2d3748;
+            margin-bottom: 20px;
+        }}
+        .promo-cta {{
+            display: inline-block;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 14px 32px;
+            text-decoration: none;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 16px;
+            transition: transform 0.2s, box-shadow 0.2s;
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }}
+        .promo-cta:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.5);
+        }}
+        .content-section {{
+            padding: 30px 20px;
+        }}
+        .content-section h2 {{
+            color: #1a202c;
+            margin-top: 0;
+            font-size: 24px;
+        }}
+        .article {{
+            margin-bottom: 25px;
+            padding-bottom: 25px;
+            border-bottom: 1px solid #e2e8f0;
+        }}
+        .article:last-child {{
+            border-bottom: none;
+        }}
+        .article h3 {{
+            color: #2d3748;
+            margin: 0 0 8px 0;
+            font-size: 18px;
+        }}
+        .article p {{
+            color: #4a5568;
+            margin: 0 0 10px 0;
+            font-size: 14px;
+        }}
+        .article a {{
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 14px;
+        }}
+        .footer {{
+            background: #2d3748;
+            color: #cbd5e0;
+            padding: 30px 20px;
+            text-align: center;
+            font-size: 13px;
+        }}
+        .preview-badge {{
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #f59e0b;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 14px;
+            box-shadow: 0 4px 12px rgba(245, 158, 11, 0.4);
+            z-index: 1000;
+        }}
+    </style>
+</head>
+<body>
+    <div class="preview-badge">📧 PREVIEW MODE</div>
+
+    <div class="newsletter-container">
+        <!-- Header -->
+        <div class="header">
+            <h1>AI Daily Post</h1>
+            <p>Monday, October 16, 2025 | Your Daily AI News Briefing</p>
+        </div>
+
+        <!-- Promotional Section -->
+        <div class="promo-section">
+            <span class="promo-label">⭐ Featured</span>
+
+            <img src="{image['image_url']}" alt="{offer['name']}" class="promo-image">
+
+            <div class="promo-text">
+                {text['text_content']}
+            </div>
+
+            <a href="{offer['destination_url']}" class="promo-cta">
+                {text['cta_text'] or 'Learn More →'}
+            </a>
+        </div>
+
+        <!-- Sample Newsletter Content -->
+        <div class="content-section">
+            <h2>📰 Today's Top Stories</h2>
+
+            <div class="article">
+                <h3>OpenAI Announces GPT-5 Breakthrough</h3>
+                <p>OpenAI has unveiled significant improvements in its latest language model, featuring enhanced reasoning capabilities and multimodal understanding.</p>
+                <a href="#">Read More →</a>
+            </div>
+
+            <div class="article">
+                <h3>Meta Releases Open-Source AI Research Tools</h3>
+                <p>Meta's AI research division has open-sourced a suite of tools designed to accelerate machine learning research and development.</p>
+                <a href="#">Read More →</a>
+            </div>
+
+            <div class="article">
+                <h3>AI Regulation Framework Gains Support</h3>
+                <p>The European Union's proposed AI Act receives backing from major tech companies, setting new standards for AI development.</p>
+                <a href="#">Read More →</a>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            <p><strong>AI Daily Post</strong></p>
+            <p>Curated AI news delivered to your inbox every weekday</p>
+            <p style="margin-top: 15px; opacity: 0.7;">© 2025 AI Daily Post. All rights reserved.</p>
+        </div>
+    </div>
+</body>
+</html>
+        """
+
+        logger.info(f"📧 Preview generated for offer {offer_id} by {current_user['email']}")
+
+        return JSONResponse(
+            content={
+                "html": preview_html,
+                "offer": dict(offer),
+                "image_used": dict(image),
+                "text_used": dict(text)
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to generate preview for offer {offer_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate preview: {str(e)}")
+
+
+# ============================================================================
+# Image Generation Endpoints (Leonardo AI)
+# ============================================================================
+
+@app.post("/api/v1/offers/{offer_id}/generate-images", tags=["Images"])
+@limiter.limit("10/hour")  # Strict limit for expensive Leonardo AI image generation
+async def generate_images(
+    http_request: Request,
+    offer_id: int,
+    request: ImageGenerationRequest,
+    current_user = Depends(get_current_user),
+    database: Database = Depends(get_db)
+):
+    """
+    Generate promotional images using Leonardo AI
+
+    Creates a generation job and waits for completion (may take 30-60 seconds).
+    Downloads and stores images in the database.
+    """
+    try:
+        # Verify offer exists
+        offer = await database.fetchrow(
+            "SELECT id, name, description FROM promo_offers WHERE id = $1",
+            offer_id
+        )
+
+        if not offer:
+            raise HTTPException(status_code=404, detail=f"Offer {offer_id} not found")
+
+        # Create generation job record
+        import json
+        job = await database.fetchrow("""
+            INSERT INTO promo_generation_jobs (
+                offer_id, job_type, status, parameters,
+                started_at, created_at
+            ) VALUES ($1, 'image', 'processing', $2::jsonb, NOW(), NOW())
+            RETURNING id
+        """, offer_id, json.dumps(request.dict()))
+
+        job_id = job['id']
+
+        try:
+            # Build generation prompt
+            base_prompt = f"{offer['name']}: {offer['description']}"
+            full_prompt = f"{base_prompt}. {request.style_description}. Professional newsletter promotional image, eye-catching, clean design."
+
+            # Initialize Leonardo service
+            leonardo = LeonardoService()
+
+            # Start generation
+            logger.info(f"🎨 Starting image generation for offer {offer_id}")
+            generation_result = await leonardo.generate_images(
+                prompt=full_prompt,
+                num_images=request.num_images,
+                width=settings.LEONARDO_WIDTH,
+                height=settings.LEONARDO_HEIGHT,
+                model=settings.LEONARDO_MODEL
+            )
+
+            # Wait for generation to complete
+            images = await leonardo.wait_for_generation(
+                generation_result["generation_id"],
+                max_wait_seconds=180  # 3 minutes max
+            )
+
+            # Download and store images
+            generated_images = []
+            for idx, img in enumerate(images):
+                # Generate filename
+                filename = f"offer_{offer_id}_{datetime.utcnow().timestamp()}_{idx}.jpg"
+                save_path = Path(settings.IMAGE_UPLOAD_DIR) / filename
+
+                # Download image
+                await leonardo.download_image(img["url"], save_path)
+
+                # Store in database
+                image_url = f"{settings.IMAGE_BASE_URL}/{filename}"
+                db_image = await database.fetchrow("""
+                    INSERT INTO promo_images (
+                        offer_id, image_url, filename,
+                        style_description, approved,
+                        created_at
+                    ) VALUES ($1, $2, $3, $4, FALSE, NOW())
+                    RETURNING id, image_url, filename, approved, created_at
+                """, offer_id, image_url, filename, request.style_description)
+
+                generated_images.append(dict(db_image))
+
+            # Update job status
+            await database.execute("""
+                UPDATE promo_generation_jobs
+                SET status = 'completed',
+                    generated_count = $1,
+                    completed_at = NOW(),
+                    duration_seconds = EXTRACT(EPOCH FROM (NOW() - started_at))::INT
+                WHERE id = $2
+            """, len(generated_images), job_id)
+
+            logger.info(f"✅ Generated {len(generated_images)} images for offer {offer_id} by {current_user['email']}")
+
+            return {
+                "success": True,
+                "offer_id": offer_id,
+                "job_id": job_id,
+                "images_generated": len(generated_images),
+                "images": generated_images
+            }
+
+        except Exception as gen_error:
+            # Update job with error
+            await database.execute("""
+                UPDATE promo_generation_jobs
+                SET status = 'failed',
+                    error_message = $1,
+                    completed_at = NOW(),
+                    duration_seconds = EXTRACT(EPOCH FROM (NOW() - started_at))::INT
+                WHERE id = $2
+            """, str(gen_error), job_id)
+
+            raise gen_error
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Image generation failed for offer {offer_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
+
+
+@app.get("/api/v1/offers/{offer_id}/images", response_model=List[ImageResponse], tags=["Images"])
+@limiter.limit("100/minute")  # Standard CRUD operation limit
+async def list_offer_images(
+    request: Request,
+    offer_id: int,
+    approved_only: bool = False,
+    current_user = Depends(get_current_user),
+    database: Database = Depends(get_db)
+):
+    """
+    List all images for a promotional offer
+
+    Optional filter to show only approved images
+    """
+    try:
+        query = """
+            SELECT id, offer_id, image_url, filename,
+                   style_description, approved,
+                   times_used, total_clicks, ctr,
+                   created_at
+            FROM promo_images
+            WHERE offer_id = $1
+        """
+
+        if approved_only:
+            query += " AND approved = TRUE"
+
+        query += " ORDER BY created_at DESC"
+
+        images = await database.fetch(query, offer_id)
+
+        return [dict(img) for img in images]
+
+    except Exception as e:
+        logger.error(f"Failed to list images for offer {offer_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list images: {str(e)}")
+
+
+@app.put("/api/v1/images/{image_id}/approve", response_model=ImageResponse, tags=["Images"])
+@limiter.limit("100/minute")  # Standard CRUD operation limit
+async def approve_image(
+    request: Request,
+    image_id: int,
+    approve: bool = True,
+    current_user = Depends(get_current_user),
+    database: Database = Depends(get_db)
+):
+    """
+    Approve or unapprove a promotional image
+
+    Only approved images can be used in newsletters
+    """
+    try:
+        result = await database.fetchrow("""
+            UPDATE promo_images
+            SET approved = $1
+            WHERE id = $2
+            RETURNING id, offer_id, image_url, filename,
+                      style_description, approved,
+                      times_used, total_clicks, ctr,
+                      created_at
+        """, approve, image_id)
+
+        if not result:
+            raise HTTPException(status_code=404, detail=f"Image {image_id} not found")
+
+        action = "approved" if approve else "unapproved"
+        logger.info(f"✅ Image {image_id} {action} by {current_user['email']}")
+
+        return dict(result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to approve image {image_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to approve image: {str(e)}")
+
+
+@app.delete("/api/v1/images/{image_id}", tags=["Images"])
+@limiter.limit("100/minute")  # Standard CRUD operation limit
+async def delete_image(
+    request: Request,
+    image_id: int,
+    current_user = Depends(get_current_user),
+    database: Database = Depends(get_db)
+):
+    """
+    Delete a promotional image
+
+    Removes from database and filesystem
+    """
+    try:
+        # Get image info before deletion
+        image = await database.fetchrow(
+            "SELECT filename, offer_id FROM promo_images WHERE id = $1",
+            image_id
+        )
+
+        if not image:
+            raise HTTPException(status_code=404, detail=f"Image {image_id} not found")
+
+        # Delete from database
+        await database.execute(
+            "DELETE FROM promo_images WHERE id = $1",
+            image_id
+        )
+
+        # Delete file from filesystem
+        try:
+            file_path = Path(settings.IMAGE_UPLOAD_DIR) / image['filename']
+            if file_path.exists():
+                file_path.unlink()
+                logger.info(f"🗑️  Deleted image file: {image['filename']}")
+        except Exception as file_error:
+            logger.warning(f"Failed to delete image file {image['filename']}: {file_error}")
+
+        logger.info(f"✅ Image {image_id} deleted by {current_user['email']}")
+
+        return {
+            "success": True,
+            "message": f"Image deleted successfully"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete image {image_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete image: {str(e)}")
+
+
+# ============================================================================
+# Text Generation Endpoints (Ollama AI)
+# ============================================================================
+
+@app.post("/api/v1/offers/{offer_id}/generate-text", tags=["Text"])
+@limiter.limit("20/hour")  # More generous than images but still limited for AI operations
+async def generate_text_variations(
+    http_request: Request,
+    offer_id: int,
+    request: TextGenerationRequest,
+    current_user = Depends(get_current_user),
+    database: Database = Depends(get_db)
+):
+    """
+    Generate promotional text variations using Ollama AI
+
+    Creates multiple text variations with different wording but same message.
+    Typically completes in 10-20 seconds.
+    """
+    try:
+        # Verify offer exists
+        offer = await database.fetchrow(
+            "SELECT id, name, description, destination_url FROM promo_offers WHERE id = $1",
+            offer_id
+        )
+
+        if not offer:
+            raise HTTPException(status_code=404, detail=f"Offer {offer_id} not found")
+
+        # Create generation job record
+        import json
+        job = await database.fetchrow("""
+            INSERT INTO promo_generation_jobs (
+                offer_id, job_type, status, parameters,
+                started_at, created_at
+            ) VALUES ($1, 'text', 'processing', $2::jsonb, NOW(), NOW())
+            RETURNING id
+        """, offer_id, json.dumps(request.dict()))
+
+        job_id = job['id']
+
+        try:
+            # Initialize Ollama service
+            ollama = OllamaService()
+
+            # Generate text variations
+            logger.info(f"✍️  Starting text generation for offer {offer_id}")
+            variations = await ollama.generate_text_variations(
+                offer_name=offer['name'],
+                offer_description=offer['description'] or '',
+                destination_url=str(offer['destination_url']),
+                tone=request.tone,
+                length_category=request.length_category,
+                num_variations=request.num_variations
+            )
+
+            # Store variations in database
+            generated_texts = []
+            for variation in variations:
+                db_text = await database.fetchrow("""
+                    INSERT INTO promo_text_variations (
+                        offer_id, text_content, cta_text,
+                        tone, length_category, approved,
+                        created_at
+                    ) VALUES ($1, $2, $3, $4, $5, FALSE, NOW())
+                    RETURNING id, text_content, cta_text, approved, created_at
+                """, offer_id, variation.get('text', ''), variation.get('cta', ''),
+                    request.tone, request.length_category)
+
+                generated_texts.append(dict(db_text))
+
+            # Update job status
+            await database.execute("""
+                UPDATE promo_generation_jobs
+                SET status = 'completed',
+                    generated_count = $1,
+                    completed_at = NOW(),
+                    duration_seconds = EXTRACT(EPOCH FROM (NOW() - started_at))::INT
+                WHERE id = $2
+            """, len(generated_texts), job_id)
+
+            logger.info(f"✅ Generated {len(generated_texts)} text variations for offer {offer_id} by {current_user['email']}")
+
+            return {
+                "success": True,
+                "offer_id": offer_id,
+                "job_id": job_id,
+                "variations_generated": len(generated_texts),
+                "variations": generated_texts
+            }
+
+        except Exception as gen_error:
+            # Update job with error
+            await database.execute("""
+                UPDATE promo_generation_jobs
+                SET status = 'failed',
+                    error_message = $1,
+                    completed_at = NOW(),
+                    duration_seconds = EXTRACT(EPOCH FROM (NOW() - started_at))::INT
+                WHERE id = $2
+            """, str(gen_error), job_id)
+
+            raise gen_error
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Text generation failed for offer {offer_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Text generation failed: {str(e)}")
+
+
+@app.get("/api/v1/offers/{offer_id}/texts", response_model=List[TextVariationResponse], tags=["Text"])
+@limiter.limit("100/minute")  # Standard CRUD operation limit
+async def list_offer_texts(
+    request: Request,
+    offer_id: int,
+    approved_only: bool = False,
+    current_user = Depends(get_current_user),
+    database: Database = Depends(get_db)
+):
+    """
+    List all text variations for a promotional offer
+
+    Optional filter to show only approved texts
+    """
+    try:
+        query = """
+            SELECT id, offer_id, text_content, cta_text,
+                   tone, length_category, approved,
+                   times_used, total_clicks, ctr,
+                   created_at
+            FROM promo_text_variations
+            WHERE offer_id = $1
+        """
+
+        if approved_only:
+            query += " AND approved = TRUE"
+
+        query += " ORDER BY created_at DESC"
+
+        texts = await database.fetch(query, offer_id)
+
+        return [dict(text) for text in texts]
+
+    except Exception as e:
+        logger.error(f"Failed to list texts for offer {offer_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to list texts: {str(e)}")
+
+
+@app.put("/api/v1/texts/{text_id}/approve", response_model=TextVariationResponse, tags=["Text"])
+@limiter.limit("100/minute")  # Standard CRUD operation limit
+async def approve_text(
+    request: Request,
+    text_id: int,
+    approve: bool = True,
+    current_user = Depends(get_current_user),
+    database: Database = Depends(get_db)
+):
+    """
+    Approve or unapprove a promotional text variation
+
+    Only approved texts can be used in newsletters
+    """
+    try:
+        result = await database.fetchrow("""
+            UPDATE promo_text_variations
+            SET approved = $1
+            WHERE id = $2
+            RETURNING id, offer_id, text_content, cta_text,
+                      tone, length_category, approved,
+                      times_used, total_clicks, ctr,
+                      created_at
+        """, approve, text_id)
+
+        if not result:
+            raise HTTPException(status_code=404, detail=f"Text {text_id} not found")
+
+        action = "approved" if approve else "unapproved"
+        logger.info(f"✅ Text {text_id} {action} by {current_user['email']}")
+
+        return dict(result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to approve text {text_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to approve text: {str(e)}")
+
+
+@app.delete("/api/v1/texts/{text_id}", tags=["Text"])
+@limiter.limit("100/minute")  # Standard CRUD operation limit
+async def delete_text(
+    request: Request,
+    text_id: int,
+    current_user = Depends(get_current_user),
+    database: Database = Depends(get_db)
+):
+    """
+    Delete a promotional text variation
+
+    Removes from database
+    """
+    try:
+        # Get text info before deletion
+        text = await database.fetchrow(
+            "SELECT offer_id, text_content FROM promo_text_variations WHERE id = $1",
+            text_id
+        )
+
+        if not text:
+            raise HTTPException(status_code=404, detail=f"Text {text_id} not found")
+
+        # Delete from database
+        await database.execute(
+            "DELETE FROM promo_text_variations WHERE id = $1",
+            text_id
+        )
+
+        logger.info(f"✅ Text {text_id} deleted by {current_user['email']}")
+
+        return {
+            "success": True,
+            "message": f"Text variation deleted successfully"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete text {text_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete text: {str(e)}")
+
+
+# ============================================================================
+# Root Endpoint
+# ============================================================================
+
+@app.get("/", tags=["System"])
+@limiter.limit("100/minute")  # Standard rate limit for informational endpoint
+async def root(request: Request):
+    """Root endpoint - API information"""
+    return {
+        "name": "Promotional Content Management API",
+        "version": "1.0.0",
+        "status": "operational",
+        "docs": "/api/v1/docs",
+        "health": "/api/v1/promo/health"
+    }
+
+
+# ============================================================================
+# Error Handlers
+# ============================================================================
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    """Custom HTTP exception handler"""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "status_code": exc.status_code
+        }
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    """General exception handler"""
+    logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "detail": str(exc) if settings.DEBUG else "An error occurred"
+        }
+    )
+
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "app.main:app",
+        host=settings.HOST,
+        port=settings.PORT,
+        reload=settings.DEBUG
+    )

@@ -1,0 +1,37 @@
+# FastAPI Backend - Promotional Content Management System
+# Created: October 16, 2025
+# Updated: October 17, 2025 - Verified and synchronized versions
+
+# Web Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6  # For file uploads
+
+# Database
+asyncpg==0.29.0  # Async PostgreSQL driver
+
+# Authentication & Security
+python-jose[cryptography]==3.3.0  # JWT tokens
+passlib[bcrypt]==1.7.4  # Password hashing
+bcrypt==4.3.0  # Explicit version for passlib compatibility
+python-dotenv==1.0.0  # Environment variables
+
+# HTTP Client (for Ollama & Leonardo APIs)
+httpx==0.28.1  # Async HTTP client (updated from 0.25.1)
+
+# Image Processing
+Pillow==10.1.0  # Image validation and processing
+
+# Utilities
+pydantic==2.12.2  # Data validation (updated from 2.5.0)
+pydantic-settings==2.1.0  # Settings management
+email-validator==2.1.0  # Email validation for EmailStr
+
+# Rate Limiting
+slowapi==0.1.9  # Rate limiting middleware
+
+# Logging
+python-json-logger==2.0.7  # Structured logging
+
+# Note: bcrypt 4.3.0 may show a warning about __about__ attribute
+# This is a known issue but does not affect functionality
