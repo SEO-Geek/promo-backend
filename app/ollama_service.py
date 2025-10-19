@@ -553,6 +553,7 @@ class OllamaService:
         offer_name: str,
         offer_description: str,
         destination_url: str,
+        offer_type: str = "affiliate",
         tone: str = "professional",
         length_category: str = "medium",
         num_variations: int = 3
@@ -651,8 +652,8 @@ class OllamaService:
         if not destination_url or not destination_url.strip():
             raise ValueError("destination_url is required and cannot be empty")
 
-        if num_variations < 1 or num_variations > 8:
-            raise ValueError(f"num_variations must be between 1 and 8, got {num_variations}")
+        if num_variations < 1 or num_variations > 30:
+            raise ValueError(f"num_variations must be between 1 and 30, got {num_variations}")
 
         # Validate tone (convert to enum if needed)
         try:
@@ -706,30 +707,67 @@ class OllamaService:
             "exciting": "Energetic, enthusiastic, inspiring. Use powerful action words."
         }
 
-        # Build comprehensive system prompt
-        system_prompt = f"""You are an expert newsletter copywriter specializing in promotional content for AI Daily Post.
+        # Build comprehensive system prompt based on offer type
+        is_coffee_sponsor = offer_type == "donation"
 
-Your task: Generate {num_variations} distinct promotional text variations for this offer:
+        if is_coffee_sponsor:
+            # Coffee sponsor goes in newsletter outro - no headline, humorous/friendly
+            system_prompt = f"""You are an expert newsletter copywriter for AI Daily Post.
+
+Your task: Generate {num_variations} distinct variations for our coffee sponsor outro message.
+
+Offer: {offer_name}
+Description: {offer_description}
+
+Context: This appears at the END of the newsletter as a friendly "support us" message.
+
+Requirements:
+- Tone: Warm, friendly, slightly humorous - NOT salesy
+- Length: {length_guidelines.get(length_category, length_guidelines['short'])}
+- Make it feel like a genuine "thanks for reading" note
+- NO headline needed (it's in the outro section)
+- Focus on community support, not hard sell
+- Each variation should have a unique angle or humor
+
+Format your response as JSON array:
+[
+  {{
+    "text": "Outro message text here...",
+    "cta": "Buy Me a Coffee"
+  }},
+  ...
+]
+
+Generate exactly {num_variations} variations."""
+        else:
+            # Regular promotional content - needs headline + body text
+            system_prompt = f"""You are an expert newsletter copywriter specializing in promotional content for AI Daily Post.
+
+Your task: Generate {num_variations} distinct promotional variations for this offer:
 
 Offer: {offer_name}
 Description: {offer_description}
 Link: {destination_url}
+Type: {offer_type}
 
 Requirements:
 - Tone: {tone_guidelines.get(tone, tone_guidelines['professional'])}
 - Length: {length_guidelines.get(length_category, length_guidelines['medium'])}
 - Each variation must include:
-  1. Compelling promotional text
-  2. A clear call-to-action (CTA) button text
+  1. HEADLINE: Attention-grabbing (5-10 words, bold-worthy)
+  2. TEXT: Compelling promotional copy
+  3. CTA: Clear call-to-action button text (2-4 words)
 - Focus on benefits, not just features
-- Make it newsletter-friendly (easy to scan)
+- Make it newsletter-friendly (easy to scan, spam-filter safe)
+- Headlines should create curiosity or highlight value
 - Each variation should be significantly different from the others
 
 Format your response as JSON array:
 [
   {{
+    "headline": "Your Attention-Grabbing Headline Here",
     "text": "Promotional text goes here...",
-    "cta": "Click Here"
+    "cta": "Get Started"
   }},
   ...
 ]

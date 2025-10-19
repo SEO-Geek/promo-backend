@@ -1050,9 +1050,9 @@ async def generate_text_variations(
     Typically completes in 10-20 seconds.
     """
     try:
-        # Verify offer exists
+        # Verify offer exists and get offer type
         offer = await database.fetchrow(
-            "SELECT id, name, description, destination_url FROM promo_offers WHERE id = $1",
+            "SELECT id, name, description, destination_url, offer_type FROM promo_offers WHERE id = $1",
             offer_id
         )
 
@@ -1081,6 +1081,7 @@ async def generate_text_variations(
                 offer_name=offer['name'],
                 offer_description=offer['description'] or '',
                 destination_url=str(offer['destination_url']),
+                offer_type=offer['offer_type'],  # Pass offer type for newsletter optimization
                 tone=gen_request.tone,
                 length_category=gen_request.length_category,
                 num_variations=gen_request.num_variations
@@ -1091,13 +1092,13 @@ async def generate_text_variations(
             for variation in variations:
                 db_text = await database.fetchrow("""
                     INSERT INTO promo_text_variations (
-                        offer_id, text_content, cta_text,
+                        offer_id, headline, text_content, cta_text,
                         tone, length_category, approved,
                         created_at
-                    ) VALUES ($1, $2, $3, $4, $5, FALSE, NOW())
-                    RETURNING id, text_content, cta_text, approved, created_at
-                """, offer_id, variation.get('text', ''), variation.get('cta', ''),
-                    gen_request.tone, gen_request.length_category)
+                    ) VALUES ($1, $2, $3, $4, $5, $6, FALSE, NOW())
+                    RETURNING id, headline, text_content, cta_text, approved, created_at
+                """, offer_id, variation.get('headline'), variation.get('text', ''),
+                    variation.get('cta', ''), gen_request.tone, gen_request.length_category)
 
                 generated_texts.append(dict(db_text))
 
@@ -1157,7 +1158,7 @@ async def list_offer_texts(
     """
     try:
         query = """
-            SELECT id, offer_id, text_content, cta_text,
+            SELECT id, offer_id, headline, text_content, cta_text,
                    tone, length_category, approved,
                    times_used, total_clicks, ctr,
                    created_at

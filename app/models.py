@@ -708,10 +708,11 @@ class TextGenerationRequest(BaseModel):
               Example: Multiple paragraphs with full value proposition
 
         num_variations (int): Number of text variations to generate
-            - Range: 1 to 8 (validated)
-            - Default: 8 (maximum variety)
+            - Range: 1 to 30 (validated)
+            - Default: 20 (recommended for high-volume newsletters)
             - Ollama generates unique variations
-            - More variations = more selection options
+            - More variations = avoid repetition in frequent campaigns
+            - For 20 newsletters/month: 30 variations covers 1.5 months
             - Each variation has unique phrasing and structure
 
     Generation Process:
@@ -724,14 +725,17 @@ class TextGenerationRequest(BaseModel):
 
     Cost Considerations:
         - Ollama charges per token generated
-        - More variations = higher cost
+        - More variations = higher cost (but better ROI for newsletter campaigns)
         - Longer text = higher cost
-        - Recommendation: 3-5 variations for good variety
+        - Recommendation for high-volume newsletters (20/month):
+          * Generate 20-30 variations per offer to cover 1-1.5 months
+          * Rotate through variations to avoid spam filter patterns
+          * Batch generation is more efficient than frequent small generations
 
     Validation Rules:
         - tone: Must be one of 5 allowed values
         - length_category: Must be one of 3 allowed values
-        - num_variations: 1-8 (enforced by API limits)
+        - num_variations: 1-30 (optimal for newsletter campaigns)
 
     Usage:
         @app.post("/api/v1/offers/{offer_id}/generate-text")
@@ -770,19 +774,19 @@ class TextGenerationRequest(BaseModel):
         {
             "tone": "exciting",
             "length_category": "medium",
-            "num_variations": 5
+            "num_variations": 25
         }
 
     Example Validation Errors:
         # Invalid tone
         {"tone": "aggressive"} → 422 Unprocessable Entity
 
-        # Too many variations
-        {"num_variations": 20} → 422 Unprocessable Entity
+        # Too many variations (exceeds limit)
+        {"num_variations": 50} → 422 Unprocessable Entity
     """
     tone: str = Field(default="professional", pattern="^(professional|casual|urgent|friendly|exciting)$")
     length_category: str = Field(default="medium", pattern="^(short|medium|long)$")
-    num_variations: int = Field(default=8, ge=1, le=8)
+    num_variations: int = Field(default=20, ge=1, le=30)
 
 
 class TextVariationUpdate(BaseModel):
@@ -979,6 +983,7 @@ class TextVariationResponse(BaseModel):
     """
     id: int
     offer_id: int
+    headline: Optional[str]  # Newsletter-optimized: NULL for coffee sponsor, text for regular offers
     text_content: str
     cta_text: Optional[str]
     tone: Optional[str]
