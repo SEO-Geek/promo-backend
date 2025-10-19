@@ -1037,9 +1037,9 @@ async def preview_newsletter(
 @app.post("/api/v1/offers/{offer_id}/generate-text", tags=["Text"])
 @limiter.limit("20/hour")  # More generous than images but still limited for AI operations
 async def generate_text_variations(
-    http_request: Request,
+    request: Request,
     offer_id: int,
-    request: TextGenerationRequest,
+    gen_request: TextGenerationRequest,
     current_user = Depends(get_current_user),
     database: Database = Depends(get_db)
 ):
@@ -1067,7 +1067,7 @@ async def generate_text_variations(
                 started_at, created_at
             ) VALUES ($1, 'text', 'processing', $2::jsonb, NOW(), NOW())
             RETURNING id
-        """, offer_id, json.dumps(request.dict()))
+        """, offer_id, json.dumps(gen_request.dict()))
 
         job_id = job['id']
 
@@ -1081,9 +1081,9 @@ async def generate_text_variations(
                 offer_name=offer['name'],
                 offer_description=offer['description'] or '',
                 destination_url=str(offer['destination_url']),
-                tone=request.tone,
-                length_category=request.length_category,
-                num_variations=request.num_variations
+                tone=gen_request.tone,
+                length_category=gen_request.length_category,
+                num_variations=gen_request.num_variations
             )
 
             # Store variations in database
@@ -1097,7 +1097,7 @@ async def generate_text_variations(
                     ) VALUES ($1, $2, $3, $4, $5, FALSE, NOW())
                     RETURNING id, text_content, cta_text, approved, created_at
                 """, offer_id, variation.get('text', ''), variation.get('cta', ''),
-                    request.tone, request.length_category)
+                    gen_request.tone, gen_request.length_category)
 
                 generated_texts.append(dict(db_text))
 

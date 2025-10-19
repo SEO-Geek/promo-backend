@@ -45,9 +45,11 @@ class Settings(BaseSettings):
         - DATABASE_URL
         - SECRET_KEY
         - OLLAMA_API_KEY, OLLAMA_API_URL
-        - LEONARDO_API_KEY, LEONARDO_API_URL
-        - IMAGE_UPLOAD_DIR, IMAGE_BASE_URL
         - ALLOWED_ORIGINS
+
+    Deprecated Variables (no longer used as of Oct 18, 2025):
+        - LEONARDO_API_KEY, LEONARDO_API_URL (image generation removed)
+        - IMAGE_UPLOAD_DIR, IMAGE_BASE_URL (text-only system)
 
     Optional Variables (have defaults):
         - HOST, PORT, DEBUG
@@ -127,56 +129,49 @@ class Settings(BaseSettings):
     Can be changed to use local Ollama instance or different endpoint
     """
 
-    LEONARDO_API_KEY: str
+    LEONARDO_API_KEY: str = ""
     """
-    Leonardo AI API key for image generation (REQUIRED)
+    DEPRECATED as of October 18, 2025 - Image generation removed
 
-    Used for: Generating promotional images with Lightning XL model
-    Rate Limits: Typically 10 requests/hour on free tier
-    Cost: Paid per generation, varies by model and resolution
-    Security: Never commit to git, store in .env file only
+    Leonardo AI API key for image generation (NO LONGER USED)
+    Newsletter promo system is now text-only per user request.
+
+    This setting remains for backwards compatibility but is not required.
+    Can be safely removed from .env file.
     """
 
-    LEONARDO_API_URL: str
+    LEONARDO_API_URL: str = "https://cloud.leonardo.ai/api/rest/v1"
     """
-    Leonardo AI API base URL (REQUIRED)
-    Default: https://cloud.leonardo.ai/api/rest/v1
-    Should not need to change unless Leonardo updates their API
+    DEPRECATED as of October 18, 2025 - Image generation removed
+
+    Leonardo AI API base URL (NO LONGER USED)
+    Kept for backwards compatibility only.
     """
 
     # ===========================================================================
-    # Image Storage Configuration
+    # Image Storage Configuration (DEPRECATED)
     # ===========================================================================
 
-    IMAGE_UPLOAD_DIR: str
+    IMAGE_UPLOAD_DIR: str = "/var/www/aidailypost/promo-images"
     """
-    Local filesystem path for storing generated images (REQUIRED)
-    Example: /var/www/aidailypost/promo-images
+    DEPRECATED as of October 18, 2025 - Image generation removed
 
-    Requirements:
-    - Directory must exist and be writable by application user
-    - Should have sufficient disk space for image storage
-    - Recommend setting up automatic cleanup for old images
+    Local filesystem path for storing generated images (NO LONGER USED)
+    Newsletter promo system is now text-only per user request.
 
-    Images are downloaded from Leonardo AI and stored locally for:
-    1. Faster access (no external API calls when displaying)
-    2. Persistence (images remain even if Leonardo deletes them)
-    3. Control (can apply post-processing if needed)
+    This setting remains for backwards compatibility but is not required.
+    Can be safely removed from .env file.
     """
 
-    IMAGE_BASE_URL: str
+    IMAGE_BASE_URL: str = "https://promo.aidailypost.com/uploads"
     """
-    Public URL prefix for accessing stored images (REQUIRED)
-    Example: https://promo.aidailypost.com/uploads
+    DEPRECATED as of October 18, 2025 - Image generation removed
 
-    Images are served via Nginx from IMAGE_UPLOAD_DIR
-    This URL is used when generating newsletter HTML and API responses
+    Public URL prefix for accessing stored images (NO LONGER USED)
+    Newsletter promo system is now text-only per user request.
 
-    Nginx configuration should map this URL to IMAGE_UPLOAD_DIR:
-    location /uploads/ {
-        alias /var/www/aidailypost/promo-images/;
-        expires 30d;
-    }
+    This setting remains for backwards compatibility but is not required.
+    Can be safely removed from .env file.
     """
 
     # ===========================================================================
@@ -255,62 +250,36 @@ class Settings(BaseSettings):
     """
 
     # ===========================================================================
-    # Leonardo AI Model Configuration
+    # Leonardo AI Model Configuration (DEPRECATED)
     # ===========================================================================
 
     LEONARDO_MODEL: str = "aa77f04e-3eec-4034-9c07-d0f619684628"
     """
-    Leonardo AI model ID for image generation
-    Default: Leonardo Lightning XL (fast, high quality)
+    DEPRECATED as of October 18, 2025 - Image generation removed
 
-    Model characteristics:
-    - Fast generation (30-60 seconds)
-    - High quality outputs
-    - Good for promotional/marketing imagery
-    - Supports style customization via prompts
-
-    To use different model, find model ID in Leonardo AI dashboard
+    Leonardo AI model ID for image generation (NO LONGER USED)
+    Newsletter promo system is now text-only per user request.
     """
 
     LEONARDO_WIDTH: int = 600
     """
-    Image width in pixels (default: 600)
+    DEPRECATED as of October 18, 2025 - Image generation removed
 
-    Optimized for email newsletters:
-    - 600px is standard email content width
-    - Responsive on mobile devices
-    - Balances quality vs file size
-
-    Constraints:
-    - Minimum: 512px (Leonardo AI requirement)
-    - Maximum: 1024px (model dependent)
-    - Must be divisible by 8
+    Image width in pixels (NO LONGER USED)
     """
 
     LEONARDO_HEIGHT: int = 400
     """
-    Image height in pixels (default: 400)
+    DEPRECATED as of October 18, 2025 - Image generation removed
 
-    Aspect ratio: 3:2 (600x400)
-    - Good balance for promotional images
-    - Not too tall (email scroll consideration)
-    - Landscape orientation for better visibility
-
-    Constraints:
-    - Minimum: 512px (Leonardo AI requirement)
-    - Maximum: 1024px (model dependent)
-    - Must be divisible by 8
+    Image height in pixels (NO LONGER USED)
     """
 
     LEONARDO_NUM_IMAGES: int = 5
     """
-    Default number of images per generation batch (default: 5)
+    DEPRECATED as of October 18, 2025 - Image generation removed
 
-    More images = more options but higher cost and time
-    Range: 1-5 images per request (API allows up to 8)
-    Generation time: ~10-15 seconds per image
-
-    Recommendation: 3-5 for variety, 1-2 for speed
+    Number of images per generation batch (NO LONGER USED)
     """
 
     # ===========================================================================
@@ -380,14 +349,10 @@ class Settings(BaseSettings):
 
     MAX_IMAGES: int = 5
     """
-    Maximum images per generation request (default: 5)
+    DEPRECATED as of October 18, 2025 - Image generation removed
 
-    Enforces reasonable limits to prevent:
-    - Excessive API costs (Leonardo charges per image)
-    - Long generation times (>5 images = >2 minutes)
-    - Storage bloat (images are 200-500KB each)
-
-    Users can generate multiple batches if needed
+    Maximum images per generation request (NO LONGER USED)
+    Newsletter promo system is now text-only per user request.
     """
 
     # ===========================================================================
