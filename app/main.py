@@ -493,6 +493,283 @@ async def select_random_promo(request: Request, database: Database = Depends(get
         )
 
 
+@app.get("/api/v1/promo/select-random-regular", response_model=PromoContentResponse, tags=["Newsletter"])
+@limiter.limit("120/minute")  # High limit for automated newsletter generation
+async def select_random_regular_promo(request: Request, database: Database = Depends(get_db)):
+    """
+    Select random REGULAR promotional content for newsletter (affiliate/review only)
+
+    **v3.5.0 TWO-PROMO SYSTEM:** This endpoint selects regular offers for mid-newsletter placement.
+    Coffee sponsor is selected separately via `/api/v1/promo/select-coffee` for outro.
+
+    **NO AUTHENTICATION REQUIRED** - Called by newsletter generation system
+
+    Selection Algorithm:
+    - Only active affiliate/review offers (excludes donation/coffee)
+    - Only offers within date range (start_date <= NOW <= end_date)
+    - Only offers with approved text variations
+    - Weighted random selection (higher weight = higher probability)
+
+    Newsletter Placement:
+    - Inserted between stories 2 and 3 (mid-newsletter position)
+    - Professional styling with clear CTA
+
+    Returns:
+        PromoContentResponse with offer info and selected text variation
+
+    Fail-Safe:
+        Returns 503 with null data if no regular offers available
+        Newsletter system will send without mid-newsletter promo (5-second timeout)
+    """
+    try:
+        # STEP 1: Query for eligible REGULAR offers (exclude coffee/donation)
+        eligible_offers = await database.fetch("""
+            SELECT DISTINCT
+                o.id,
+                o.name,
+                o.offer_type,
+                o.affiliate_slug,
+                o.weight,
+                o.destination_url
+            FROM promo_offers o
+            WHERE o.status = 'active'
+            AND o.offer_type IN ('affiliate', 'review')  -- v3.5.0: Exclude donation (coffee)
+            AND (o.start_date IS NULL OR o.start_date <= NOW())
+            AND (o.end_date IS NULL OR o.end_date >= NOW())
+            AND EXISTS (
+                SELECT 1 FROM promo_text_variations t
+                WHERE t.offer_id = o.id AND t.approved = TRUE
+            )
+        """)
+
+        # STEP 2: Fail-safe if no regular offers available
+        if not eligible_offers:
+            logger.warning("⚠️ No eligible regular offers for newsletter selection")
+            return JSONResponse(
+                content={
+                    "offer_id": None,
+                    "name": None,
+                    "offer_type": None,
+                    "affiliate_slug": None,
+                    "approved_text": None,
+                    "message": "No active regular offers available"
+                },
+                status_code=503
+            )
+
+        # STEP 3: Weighted random selection
+        import random
+        total_weight = sum(offer['weight'] for offer in eligible_offers)
+        rand = random.uniform(0, total_weight)
+
+        cumulative_weight = 0
+        selected_offer = None
+
+        for offer in eligible_offers:
+            cumulative_weight += offer['weight']
+            if rand <= cumulative_weight:
+                selected_offer = offer
+                break
+
+        if not selected_offer:
+            selected_offer = eligible_offers[0]
+            logger.warning(f"⚠️ Weighted selection failed, using first regular offer as fallback")
+
+        # STEP 4: Select random text variation
+        text_variations = await database.fetch("""
+            SELECT id, headline, text_content, cta_text
+            FROM promo_text_variations
+            WHERE offer_id = $1 AND approved = TRUE
+            ORDER BY RANDOM()
+            LIMIT 1
+        """, selected_offer['id'])
+
+        if not text_variations:
+            logger.error(f"❌ Regular offer {selected_offer['id']} has no approved text")
+            return JSONResponse(
+                content={
+                    "offer_id": None,
+                    "name": None,
+                    "offer_type": None,
+                    "affiliate_slug": None,
+                    "approved_text": None,
+                    "message": "Selected offer has no approved content"
+                },
+                status_code=503
+            )
+
+        selected_text = text_variations[0]
+
+        # STEP 5: Build tracking link
+        base_domain = "https://aidailypost.com"
+        if selected_offer['offer_type'] == 'review':
+            link = f"{base_domain}/review/{selected_offer['affiliate_slug']}"
+        else:
+            link = f"{base_domain}/{selected_offer['affiliate_slug']}"
+
+        link += f"?utm_source=newsletter&promo_var={selected_text['id']}"
+
+        logger.info(
+            f"✅ Regular newsletter promo selected: Offer {selected_offer['id']} ({selected_offer['name']}) "
+            f"with text variation {selected_text['id']}"
+        )
+
+        # STEP 6: Return promo content
+        return {
+            "offer_id": selected_offer['id'],
+            "offer_name": selected_offer['name'],
+            "offer_type": selected_offer['offer_type'],
+            "headline": selected_text.get('headline'),  # May be None for some offers
+            "text": selected_text['text_content'],
+            "cta": selected_text['cta_text'],
+            "link": link,
+            "variation_id": selected_text['id']
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Failed to select regular newsletter promo: {e}")
+        return JSONResponse(
+            content={
+                "offer_id": None,
+                "name": None,
+                "offer_type": None,
+                "affiliate_slug": None,
+                "approved_text": None,
+                "message": f"Selection failed: {str(e)}"
+            },
+            status_code=503
+        )
+
+
+@app.get("/api/v1/promo/select-coffee", response_model=PromoContentResponse, tags=["Newsletter"])
+@limiter.limit("120/minute")  # High limit for automated newsletter generation
+async def select_coffee_sponsor(request: Request, database: Database = Depends(get_db)):
+    """
+    Select COFFEE SPONSOR content for newsletter outro (donation offer only)
+
+    **v3.5.0 TWO-PROMO SYSTEM:** This endpoint selects the coffee sponsor for outro placement.
+    Regular offers are selected separately via `/api/v1/promo/select-random-regular`.
+
+    **NO AUTHENTICATION REQUIRED** - Called by newsletter generation system
+
+    Selection Algorithm:
+    - Always selects coffee offer (ID 2, type='donation')
+    - Must be active with approved text variations
+    - Random text variation (up to 60 humor-focused variations)
+
+    Newsletter Placement:
+    - Inserted in outro (after all stories)
+    - Natural text styling (blends in, doesn't look promotional)
+    - Humor-focused copy asking for coffee donations
+
+    Returns:
+        PromoContentResponse with coffee sponsor info and selected text variation
+
+    Fail-Safe:
+        Returns 503 with null data if coffee offer not available
+        Newsletter system will send without outro sponsor (5-second timeout)
+    """
+    try:
+        # STEP 1: Query for coffee sponsor offer (should be ID 2, type='donation')
+        coffee_offer = await database.fetchrow("""
+            SELECT
+                o.id,
+                o.name,
+                o.offer_type,
+                o.affiliate_slug,
+                o.destination_url
+            FROM promo_offers o
+            WHERE o.id = 2  -- Coffee offer is always ID 2
+            AND o.offer_type = 'donation'
+            AND o.status = 'active'
+            AND (o.start_date IS NULL OR o.start_date <= NOW())
+            AND (o.end_date IS NULL OR o.end_date >= NOW())
+            AND EXISTS (
+                SELECT 1 FROM promo_text_variations t
+                WHERE t.offer_id = o.id AND t.approved = TRUE
+            )
+        """)
+
+        # STEP 2: Fail-safe if coffee sponsor not available
+        if not coffee_offer:
+            logger.warning("⚠️ Coffee sponsor offer not available for newsletter")
+            return JSONResponse(
+                content={
+                    "offer_id": None,
+                    "name": None,
+                    "offer_type": None,
+                    "affiliate_slug": None,
+                    "approved_text": None,
+                    "message": "Coffee sponsor not available"
+                },
+                status_code=503
+            )
+
+        # STEP 3: Select random text variation from coffee offer
+        # Note: Coffee offer may have up to 60 variations (humor-focused)
+        # Each newsletter gets a different variation to keep it fresh
+        text_variations = await database.fetch("""
+            SELECT id, text_content, cta_text
+            FROM promo_text_variations
+            WHERE offer_id = $1 AND approved = TRUE
+            ORDER BY RANDOM()
+            LIMIT 1
+        """, coffee_offer['id'])
+
+        if not text_variations:
+            logger.error(f"❌ Coffee offer {coffee_offer['id']} has no approved text")
+            return JSONResponse(
+                content={
+                    "offer_id": None,
+                    "name": None,
+                    "offer_type": None,
+                    "affiliate_slug": None,
+                    "approved_text": None,
+                    "message": "Coffee sponsor has no approved content"
+                },
+                status_code=503
+            )
+
+        selected_text = text_variations[0]
+
+        # STEP 4: Build tracking link (coffee = donation link)
+        base_domain = "https://aidailypost.com"
+        link = f"{base_domain}/{coffee_offer['affiliate_slug']}"
+        link += f"?utm_source=newsletter&promo_var={selected_text['id']}"
+
+        logger.info(
+            f"☕ Coffee sponsor selected for newsletter outro: "
+            f"Variation {selected_text['id']} (offer {coffee_offer['id']})"
+        )
+
+        # STEP 5: Return coffee sponsor content
+        # Note: Coffee sponsor typically has NO headline (blends into outro naturally)
+        return {
+            "offer_id": coffee_offer['id'],
+            "offer_name": coffee_offer['name'],
+            "offer_type": coffee_offer['offer_type'],
+            "headline": None,  # Coffee sponsor never has headline
+            "text": selected_text['text_content'],
+            "cta": selected_text['cta_text'],
+            "link": link,
+            "variation_id": selected_text['id']
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Failed to select coffee sponsor: {e}")
+        return JSONResponse(
+            content={
+                "offer_id": None,
+                "name": None,
+                "offer_type": None,
+                "affiliate_slug": None,
+                "approved_text": None,
+                "message": f"Selection failed: {str(e)}"
+            },
+            status_code=503
+        )
+
+
 # ============================================================================
 # Offer Management Endpoints (CRUD)
 # ============================================================================
@@ -1075,19 +1352,19 @@ async def generate_text_variations(
             # Initialize Ollama service
             ollama = OllamaService()
 
-            # Generate text variations
-            logger.info(f"✍️  Starting text generation for offer {offer_id}")
+            # Generate text variations with hardcoded best-practice defaults
+            logger.info(f"✍️  Starting text generation for offer {offer_id} ({offer['offer_type']}) - {gen_request.num_variations} variations")
             variations = await ollama.generate_text_variations(
                 offer_name=offer['name'],
                 offer_description=offer['description'] or '',
                 destination_url=str(offer['destination_url']),
-                offer_type=offer['offer_type'],  # Pass offer type for newsletter optimization
-                tone=gen_request.tone,
-                length_category=gen_request.length_category,
+                offer_type=offer['offer_type'],  # Determines prompt strategy (regular vs coffee)
+                tone="friendly",  # Hardcoded: Best practice for newsletters (81% preference)
+                length_category="medium",  # Hardcoded: 60-80 words optimal for CTR
                 num_variations=gen_request.num_variations
             )
 
-            # Store variations in database
+            # Store variations in database with hardcoded tone/length
             generated_texts = []
             for variation in variations:
                 db_text = await database.fetchrow("""
@@ -1095,10 +1372,10 @@ async def generate_text_variations(
                         offer_id, headline, text_content, cta_text,
                         tone, length_category, approved,
                         created_at
-                    ) VALUES ($1, $2, $3, $4, $5, $6, FALSE, NOW())
+                    ) VALUES ($1, $2, $3, $4, 'friendly', 'medium', FALSE, NOW())
                     RETURNING id, headline, text_content, cta_text, approved, created_at
                 """, offer_id, variation.get('headline'), variation.get('text', ''),
-                    variation.get('cta', ''), gen_request.tone, gen_request.length_category)
+                    variation.get('cta', ''))
 
                 generated_texts.append(dict(db_text))
 
@@ -1199,7 +1476,7 @@ async def approve_text(
             UPDATE promo_text_variations
             SET approved = $1
             WHERE id = $2
-            RETURNING id, offer_id, text_content, cta_text,
+            RETURNING id, offer_id, headline, text_content, cta_text,
                       tone, length_category, approved,
                       times_used, total_clicks, ctr,
                       created_at
@@ -1230,36 +1507,43 @@ async def update_text(
     database: Database = Depends(get_db)
 ):
     """
-    Update promotional text variation (user adjustments)
+    Update promotional text variation (manual inline editing) - v3.5.0
 
-    Enables the "Generate → Review → ADJUST → Approve" workflow.
+    Enables the "Generate → Review → EDIT → Approve" workflow with inline editing.
     User can manually edit AI-generated text before approval.
 
     **Use Cases:**
     - Fix typos in AI-generated text
     - Adjust phrasing to match brand voice
     - Add/remove details based on offer changes
-    - Customize CTA button text
-    - Reclassify tone/length after edits
+    - Customize CTA button text for A/B testing
+    - Add/edit headline for regular offers
 
-    **What Can Be Updated:**
-    - text_content: The promotional text (required, 10-1000 chars)
-    - cta_text: Call-to-action button (optional, 3-50 chars)
-    - tone: Tone classification (optional)
-    - length_category: Length classification (optional)
+    **What Can Be Updated (v3.5.0):**
+    - headline: Optional headline (max 150 chars, for regular offers)
+    - text_content: The promotional text (required, 10-800 chars)
+    - cta_text: Call-to-action button (required, 3-40 chars)
 
     **What CANNOT Be Updated:**
     - approved flag (use /approve endpoint)
     - performance metrics (impressions, clicks, CTR)
+    - tone/length (hardcoded to best practices)
     - creation timestamp
 
-    **Example Request:**
+    **Example Request (Regular Offer):**
     ```json
     {
-        "text_content": "Flash Sale! 50% off all courses this weekend only. Don't miss out!",
-        "cta_text": "Shop Now",
-        "tone": "urgent",
-        "length_category": "short"
+        "headline": "Limited Offer: 50% Off",
+        "text_content": "Flash sale this weekend! Get half off all AI tools and courses.",
+        "cta_text": "Claim Discount"
+    }
+    ```
+
+    **Example Request (Coffee Sponsor):**
+    ```json
+    {
+        "text_content": "Our AI summaries run on caffeine (and humor). Support our coffee fund!",
+        "cta_text": "Buy Me a Coffee"
     }
     ```
 
@@ -1275,24 +1559,15 @@ async def update_text(
         if not existing:
             raise HTTPException(status_code=404, detail=f"Text variation {text_id} not found")
 
-        # Build UPDATE query dynamically (only update provided fields)
-        update_fields = ["text_content = $1"]
-        params = [update_data.text_content]
-        param_count = 2
+        # Build UPDATE query with new v3.5.0 fields
+        update_fields = ["text_content = $1", "cta_text = $2", "updated_at = NOW()"]
+        params = [update_data.text_content, update_data.cta_text]
+        param_count = 3
 
-        if update_data.cta_text is not None:
-            update_fields.append(f"cta_text = ${param_count}")
-            params.append(update_data.cta_text)
-            param_count += 1
-
-        if update_data.tone is not None:
-            update_fields.append(f"tone = ${param_count}")
-            params.append(update_data.tone)
-            param_count += 1
-
-        if update_data.length_category is not None:
-            update_fields.append(f"length_category = ${param_count}")
-            params.append(update_data.length_category)
+        # Add optional headline field
+        if update_data.headline is not None:
+            update_fields.append(f"headline = ${param_count}")
+            params.append(update_data.headline)
             param_count += 1
 
         # Add text_id as last parameter
@@ -1303,18 +1578,18 @@ async def update_text(
             UPDATE promo_text_variations
             SET {', '.join(update_fields)}
             WHERE id = ${param_count}
-            RETURNING id, offer_id, text_content, cta_text,
+            RETURNING id, offer_id, headline, text_content, cta_text,
                       tone, length_category, approved,
                       impressions as times_used,
                       clicks as total_clicks,
                       ctr,
-                      created_at
+                      created_at, updated_at
         """
 
         result = await database.fetchrow(query, *params)
 
-        logger.info(f"✅ Text {text_id} updated by {current_user['email']}")
-        logger.debug(f"Updated fields: {', '.join([f.split(' = ')[0] for f in update_fields])}")
+        logger.info(f"✅ Text {text_id} updated by {current_user['email']} (inline editing)")
+        logger.debug(f"Updated fields: headline={'Yes' if update_data.headline else 'No'}, text_content=Yes, cta_text=Yes")
 
         return dict(result)
 
@@ -1366,6 +1641,140 @@ async def delete_text(
     except Exception as e:
         logger.error(f"Failed to delete text {text_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to delete text: {str(e)}")
+
+
+@app.post("/api/v1/texts/{text_id}/regenerate", tags=["Text"])
+@limiter.limit("20/hour")  # Regeneration uses AI, so more limited
+async def regenerate_text(
+    request: Request,
+    text_id: int,
+    current_user = Depends(get_current_user),
+    database: Database = Depends(get_db)
+):
+    """
+    Regenerate a single text variation using AI - v3.5.0
+
+    Replaces an existing text variation with a brand new AI-generated one.
+    Useful when user doesn't like the current variation and wants a fresh alternative.
+
+    **Workflow:**
+    1. User views generated text variations
+    2. User doesn't like one variation
+    3. User clicks "🔄 Regenerate" button
+    4. Backend fetches original offer details (name, description, type)
+    5. Backend calls Ollama AI to generate 1 new variation
+    6. Backend replaces old text with new text (same text_id)
+    7. Frontend updates display with new text
+    8. User can approve new text or regenerate again
+
+    **What Happens:**
+    - Generates 1 new variation with same offer context
+    - Uses hardcoded best practices (tone="friendly", length="medium")
+    - Resets approved flag to FALSE (needs re-approval)
+    - Keeps same text_id (updates in place)
+    - Preserves performance metrics (impressions, clicks) for old version
+
+    **Rate Limiting:**
+    - 20 regenerations per hour (AI operations are expensive)
+    - Use sparingly - editing is faster than regeneration
+
+    **Example Usage:**
+    ```
+    POST /api/v1/texts/123/regenerate
+    ```
+
+    **Response:**
+    ```json
+    {
+        "success": true,
+        "text_id": 123,
+        "variation": {
+            "headline": "New AI-generated headline",
+            "text": "Brand new promotional text...",
+            "cta": "New CTA Button Text"
+        }
+    }
+    ```
+
+    **Error Cases:**
+    - 404: Text variation not found
+    - 500: AI generation failed
+    - 429: Rate limit exceeded (20/hour)
+    """
+    try:
+        # Get original text's offer details
+        text = await database.fetchrow("""
+            SELECT tv.id, tv.offer_id,
+                   o.name, o.description, o.destination_url, o.offer_type
+            FROM promo_text_variations tv
+            JOIN promo_offers o ON tv.offer_id = o.id
+            WHERE tv.id = $1
+        """, text_id)
+
+        if not text:
+            raise HTTPException(status_code=404, detail=f"Text variation {text_id} not found")
+
+        offer_id = text['offer_id']
+        offer_type = text['offer_type']
+
+        logger.info(f"🔄 Regenerating text {text_id} for offer {offer_id} ({offer_type})")
+
+        # Generate 1 new variation using Ollama AI
+        ollama = OllamaService()
+        variations = await ollama.generate_text_variations(
+            offer_name=text['name'],
+            offer_description=text['description'] or '',
+            destination_url=str(text['destination_url']),
+            offer_type=offer_type,
+            tone="friendly",  # Hardcoded best practice
+            length_category="medium",  # Hardcoded best practice
+            num_variations=1  # Only generate 1 replacement
+        )
+
+        if not variations or len(variations) == 0:
+            raise HTTPException(status_code=500, detail="AI generation failed to produce variation")
+
+        new_text = variations[0]
+
+        # Replace old text with new AI-generated text
+        result = await database.fetchrow("""
+            UPDATE promo_text_variations
+            SET headline = $1,
+                text_content = $2,
+                cta_text = $3,
+                tone = 'friendly',
+                length_category = 'medium',
+                approved = FALSE,
+                updated_at = NOW()
+            WHERE id = $4
+            RETURNING id, offer_id, headline, text_content, cta_text,
+                      tone, length_category, approved,
+                      created_at, updated_at
+        """,
+            new_text.get('headline'),
+            new_text.get('text'),
+            new_text.get('cta'),
+            text_id
+        )
+
+        logger.info(f"✅ Text {text_id} regenerated successfully by {current_user['email']}")
+
+        return {
+            "success": True,
+            "text_id": text_id,
+            "variation": {
+                "headline": new_text.get('headline'),
+                "text": new_text.get('text'),
+                "cta": new_text.get('cta')
+            },
+            "updated_record": dict(result)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to regenerate text {text_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to regenerate text: {str(e)}")
 
 
 # ============================================================================

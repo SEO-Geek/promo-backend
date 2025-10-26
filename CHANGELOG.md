@@ -5,6 +5,42 @@ All notable changes to the AI Daily Post Promotional Content Management System w
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.2] - 2025-10-26
+
+### 🐛 Critical Bug Fix - Approve Endpoint Validation Error
+
+**Status:** Production-ready - Approve functionality fully operational
+
+**Issue:** Approve endpoint was failing with `ResponseValidationError` when approving coffee sponsor text variations due to missing `headline` field in SQL RETURNING clause.
+
+**Error Message:**
+```
+fastapi.exceptions.ResponseValidationError: 1 validation errors:
+  {'type': 'missing', 'loc': ('response', 'headline'), 'msg': 'Field required'}
+INFO: "PUT /api/v1/texts/83/approve?approve=true HTTP/1.1" 500 Internal Server Error
+```
+
+**Root Cause:** The approve endpoint's SQL query was missing `headline` in its RETURNING clause, causing Pydantic response model validation to fail because `TextVariationResponse` expects all fields including `headline` (which is `Optional[str]` and can be NULL for coffee sponsor texts).
+
+### Fixed
+- **Approve Endpoint SQL Query** (`/app/main.py` line 1479)
+  - Added `headline` to RETURNING clause
+  - Before: `RETURNING id, offer_id, text_content, cta_text, ...`
+  - After: `RETURNING id, offer_id, headline, text_content, cta_text, ...`
+  - Now properly returns all fields required by `TextVariationResponse` model
+  - Handles NULL headline values correctly (coffee sponsor texts)
+
+### Verified
+- ✅ Approve button now works for coffee sponsor texts (headline=NULL)
+- ✅ HTTP 200 OK response instead of 500 Internal Server Error
+- ✅ Status changes from "Draft" to "Approved" in UI
+- ✅ Action buttons update correctly (Approve → Edit)
+- ✅ Backend logs show: `INFO: "PUT /api/v1/texts/82/approve?approve=true HTTP/1.1" 200 OK`
+
+**Testing:** Verified at https://promo.aidailypost.com/offers/2/generate-text with 30 coffee sponsor text variations
+
+---
+
 ## [3.4.1] - 2025-10-20
 
 ### Newsletter-Optimized Text Generation + Critical UI Fixes ✅
