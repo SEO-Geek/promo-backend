@@ -5,6 +5,36 @@ All notable changes to the AI Daily Post Promotional Content Management System w
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.3] - 2025-10-26
+
+### 🐛 Critical Bug Fix - Regenerate Endpoint Database Error
+
+**Status:** Production-ready - Regenerate functionality fully operational
+
+**Issue:** Regenerate endpoint was failing with 500 Internal Server Error when attempting to regenerate text variations due to referencing non-existent `updated_at` column.
+
+**Error:** SQL error trying to SET and RETURN `updated_at` column that doesn't exist in `promo_text_variations` table.
+
+**Root Cause:** The regenerate endpoint SQL query referenced `updated_at` column in both SET and RETURNING clauses, but the table schema only has `created_at` column (no `updated_at` tracking).
+
+### Fixed
+- **Regenerate Endpoint SQL Query** (`/app/main.py` line 1740-1751)
+  - Removed `updated_at = NOW()` from SET clause
+  - Removed `updated_at` from RETURNING clause
+  - Query now only uses columns that exist in table schema
+  - Regeneration now works correctly for all text variations
+
+### Verified
+- ✅ Regenerate endpoint no longer returns 500 Internal Server Error
+- ✅ AI regeneration working (Ollama Cloud returns new text)
+- ✅ Text variations updated correctly in database
+- ✅ Approved flag reset to FALSE after regeneration (requires re-approval)
+- ✅ Same text_id preserved (updates in place)
+
+**Testing:** Fixed SQL query tested with coffee sponsor text variations (headline=NULL supported)
+
+---
+
 ## [3.4.2] - 2025-10-26
 
 ### 🐛 Critical Bug Fix - Approve Endpoint Validation Error

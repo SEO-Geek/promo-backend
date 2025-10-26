@@ -1744,12 +1744,11 @@ async def regenerate_text(
                 cta_text = $3,
                 tone = 'friendly',
                 length_category = 'medium',
-                approved = FALSE,
-                updated_at = NOW()
+                approved = FALSE
             WHERE id = $4
             RETURNING id, offer_id, headline, text_content, cta_text,
                       tone, length_category, approved,
-                      created_at, updated_at
+                      created_at
         """,
             new_text.get('headline'),
             new_text.get('text'),
